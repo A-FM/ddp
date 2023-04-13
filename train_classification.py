@@ -18,6 +18,8 @@ import random
 import provider
 from data_utils.ModelNetDataLoader import ModelNetDataLoader
 from torch import nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -30,15 +32,12 @@ def init_seeds(seed=0, cuda_deterministic=True):
     torch.manual_seed(seed)
 
 
-init_seeds()
-
-
 def parse_args():
     '''PARAMETERS'''
     parser = argparse.ArgumentParser('training')
     parser.add_argument('--use_cpu', action='store_true', default=False, help='use cpu mode')
     parser.add_argument('--gpu', type=str, default='0,1,2,3,4,5,6,7', help='specify gpu device')
-    parser.add_argument('--batch_size', type=int, default=56 * 8, help='batch size in training')
+    parser.add_argument('--batch_size', type=int, default=56, help='batch size in training')
     parser.add_argument('--model', default='pointnet_cls', help='model name [default: pointnet_cls]')
     parser.add_argument('--num_category', default=40, type=int, choices=[10, 40], help='training on ModelNet10/40')
     parser.add_argument('--epoch', default=200000, type=int, help='number of epoch in training')
@@ -63,7 +62,6 @@ def test(model, loader, num_class=40):
     mean_correct = []
     class_acc = np.zeros((num_class, 3))
     classifier = model.eval()
-
     for j, (points, target) in tqdm(enumerate(loader), total=len(loader)):
 
         if not args.use_cpu:
@@ -94,6 +92,15 @@ def main(args):
     def log_string(str):
         logger.info(str)
         print(str)
+
+    dist.init_process_group('gloo')
+    rank = torch.distributed.get_rank()
+    init_seeds(1 + rank)
+
+    # torchrun的新改动，替代原先的LOCAL_RANK获取方式
+    local_rank = int(os.environ["LOCAL_RANK"])
+
+    torch.cuda.set_device(local_rank)
 
     '''HYPER PARAMETER'''
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -132,9 +139,12 @@ def main(args):
 
     train_dataset = ModelNetDataLoader(root=data_path, args=args, split='train', process_data=args.process_data)
     test_dataset = ModelNetDataLoader(root=data_path, args=args, split='test', process_data=args.process_data)
-    trainDataLoader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                  num_workers=0, drop_last=True)
-    testDataLoader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
+    trainDataLoader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
+                                                  num_workers=0, drop_last=True, sampler=train_sampler)
+    testDataLoader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, num_workers=0,
+                                                 sampler=test_sampler)
 
     '''MODEL LOADING'''
     num_class = args.num_category
@@ -148,18 +158,20 @@ def main(args):
     classifier.apply(inplace_relu)
 
     if not args.use_cpu:
-        classifier = classifier.cuda()
-        classifier = nn.DataParallel(classifier, device_ids=[0, 1, 2, 3, 4, 5, 6, 7])
-        criterion = criterion.cuda()
+        classifier = classifier.to(local_rank)
+        criterion = criterion.to(local_rank)
 
     try:
         checkpoint = torch.load(str(exp_dir) + '/checkpoints/best_model.pth')
         start_epoch = checkpoint['epoch']
-        classifier.load_state_dict(checkpoint['model_state_dict'])
+        if dist.get_rank() == 0:
+            classifier.load_state_dict(checkpoint['model_state_dict'])
         log_string('Use pretrain model')
     except:
         log_string('No existing model, starting training from scratch...')
         start_epoch = 0
+
+    classifier = DDP(classifier, device_ids=[local_rank], output_device=local_rank)
 
     if args.optimizer == 'Adam':
         optimizer = torch.optim.Adam(
@@ -184,6 +196,7 @@ def main(args):
         log_string('Epoch %d (%d/%s):' % (global_epoch + 1, epoch + 1, args.epoch))
         mean_correct = []
         classifier = classifier.train()
+        trainDataLoader.sampler.set_epoch(epoch)
 
         scheduler.step()
         for batch_id, (points, target) in tqdm(enumerate(trainDataLoader, 0), total=len(trainDataLoader),
