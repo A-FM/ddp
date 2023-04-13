@@ -90,8 +90,9 @@ def test(model, loader, num_class=40):
 
 def main(args):
     def log_string(str):
-        logger.info(str)
-        print(str)
+        if dist.get_rank() == 0:
+            logger.info(str)
+            print(str)
 
     dist.init_process_group('gloo')
     rank = torch.distributed.get_rank()
@@ -229,16 +230,16 @@ def main(args):
         with torch.no_grad():
             instance_acc, class_acc = test(classifier.eval(), testDataLoader, num_class=num_class)
 
-            if (instance_acc >= best_instance_acc):
+            if instance_acc >= best_instance_acc:
                 best_instance_acc = instance_acc
                 best_epoch = epoch + 1
 
-            if (class_acc >= best_class_acc):
+            if class_acc >= best_class_acc:
                 best_class_acc = class_acc
             log_string('Test Instance Accuracy: %f, Class Accuracy: %f' % (instance_acc, class_acc))
             log_string('Best Instance Accuracy: %f, Class Accuracy: %f' % (best_instance_acc, best_class_acc))
 
-            if (instance_acc >= best_instance_acc):
+            if instance_acc >= best_instance_acc and dist.get_rank() == 0:
                 logger.info('Save model...')
                 savepath = str(checkpoints_dir) + '/best_model.pth'
                 log_string('Saving at %s' % savepath)
